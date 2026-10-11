@@ -972,6 +972,14 @@ namespace Rasa.Networking
 
                 OnEncrypt?.Invoke(data, ref length);
 
+                // The reported native-client failure is "Received bad payload size:
+                // 4944". Record the actual ENCRYPTED payload length and the specific
+                // game message that produced it, not merely the unencrypted Python size.
+                // Only large frames are logged; normal movement/actor traffic is untouched.
+                if (length >= 4000)
+                    SafeLog($"Large outbound frame: {length} encrypted bytes, " +
+                        $"packet={packet}, destination={SafeRemoteAddress()}");
+
                 if (at + LengthSize + length > data.MaxLength)
                     throw new InvalidOperationException($"A {length} byte frame does not fit in the {data.MaxLength - at - LengthSize} bytes left in the block.");
 

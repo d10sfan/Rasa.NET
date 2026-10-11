@@ -16,6 +16,12 @@ namespace Rasa.Packets.Protocol
         public const int MaxSize = ushort.MaxValue;
         public const int MaxExpandedSize = 4 * MaxSize;
 
+        // The retail client's network receive path rejects large frames. Compression is
+        // worth attempting before a game payload grows into that range. The exact native
+        // limit is not defined in the Python client, so outbound wire-size warnings below
+        // still cover payloads that don't compress enough.
+        private const int AutoCompressPayloadAt = 3500;
+
         public ClientMessageOpcode Type { get; private set; } = ClientMessageOpcode.None;
 
         public ushort Size { get; private set; }
@@ -167,6 +173,14 @@ namespace Rasa.Packets.Protocol
             }
         }
 
+        public override string ToString()
+        {
+            if (Message is CallMethodMessage method)
+                return $"CallMethod {method.MethodId} ({method.Packet?.GetType().Name ?? "unknown"}, entity {method.EntityId})";
+
+            return $"{Type} ({Message?.GetType().Name ?? "unknown"})";
+        }
+
         public void Write(BinaryWriter bw)
         {
             var sizePosition = bw.BaseStream.Position;
@@ -215,29 +229,25 @@ namespace Rasa.Packets.Protocol
                     uncompressedSize = (int)ms.Position;
                 }
 
-                var compress = (Message.SubtypeFlags & ClientMessageSubtypeFlag.Compress) == ClientMessageSubtypeFlag.Compress && uncompressedSize > 0;
+                // Previously only Message.SubtypeFlags was considered, ignoring the
+                // ProtocolPacket's explicit Compress choice. In particular CallMethodMessage
+                // has HasSubtype but not Compress, so even multi-KB Python snapshots went
+                // out uncompressed. Try compression for large payloads as well, and use it
+                // only when it actually makes the frame smaller.
+                var requestedCompression = Compress ||
+                    (Message.SubtypeFlags & ClientMessageSubtypeFlag.Compress) == ClientMessageSubtypeFlag.Compress;
+                var tryCompression = uncompressedSize > 0 &&
+                    (requestedCompression || uncompressedSize >= AutoCompressPayloadAt);
+                byte[] compressedBuffer = null;
+                int compressedSize = 0;
 
-                using (var writer = new ProtocolBufferWriter(bw, ProtocolBufferFlags.DontFragment))
+                try
                 {
-                    writer.WriteProtocolFlags();
-
-                    writer.WritePacketType((ushort)Message.Type, compress);
-
-                    writer.WriteXORCheck((int)(bw.BaseStream.Position - packetBeginPosition));
-                }
-
-                int packetSize = uncompressedSize;
-
-                if (compress)
-                {
-                    bw.Write((byte)0x01);
-                    bw.Write(uncompressedSize);
-
-                    var compressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedSize);
-                    try
+                    if (tryCompression)
                     {
-                        int compressedSize;
-
+                        // DEFLATE can grow an incompressible input slightly. Leave room for
+                        // that, rather than failing a perfectly valid large game packet.
+                        compressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedSize + 128);
                         using (var compressStream = new MemoryStream(compressedBuffer, true))
                         {
                             using (var compressorStream = new DeflateStream(compressStream, CompressionMode.Compress, true))
@@ -245,26 +255,41 @@ namespace Rasa.Packets.Protocol
 
                             compressedSize = (int)compressStream.Position;
                         }
+                    }
 
+                    // Compressed frames have an extra type byte and a 32-bit expanded-size
+                    // field. Don't send a larger frame just because it crossed the threshold.
+                    var compress = tryCompression &&
+                        (requestedCompression || compressedSize + 5 < uncompressedSize);
+
+                    using (var writer = new ProtocolBufferWriter(bw, ProtocolBufferFlags.DontFragment))
+                    {
+                        writer.WriteProtocolFlags();
+                        writer.WritePacketType((ushort)Message.Type, compress);
+                        writer.WriteXORCheck((int)(bw.BaseStream.Position - packetBeginPosition));
+                    }
+
+                    if (compress)
+                    {
+                        bw.Write((byte)0x01);
+                        bw.Write(uncompressedSize);
                         bw.Write(compressedBuffer, 0, compressedSize);
                     }
-                    finally
+                    else
                     {
-                        ArrayPool<byte>.Shared.Return(compressedBuffer);
+                        bw.Write(packetBuffer, 0, uncompressedSize);
                     }
+
+                    var currentPosition = bw.BaseStream.Position;
+                    bw.BaseStream.Position = sizePosition;
+                    bw.Write((ushort)(currentPosition - sizePosition));
+                    bw.BaseStream.Position = currentPosition;
                 }
-                else
+                finally
                 {
-                    bw.Write(packetBuffer, 0, packetSize);
+                    if (compressedBuffer != null)
+                        ArrayPool<byte>.Shared.Return(compressedBuffer);
                 }
-
-                var currentPosition = bw.BaseStream.Position;
-
-                bw.BaseStream.Position = sizePosition;
-
-                bw.Write((ushort)(currentPosition - sizePosition));
-
-                bw.BaseStream.Position = currentPosition;
             }
             finally
             {
